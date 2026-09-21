@@ -1,0 +1,6 @@
+# pixel index sidecar
+.pixel/
+
+node_modules/
+*.tgz
+coverage/
