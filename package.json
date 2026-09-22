@@ -1,7 +1,7 @@
 {
   "name": "pi-navrness",
   "version": "0.1.0",
-  "description": "Opt-in Herdr visibility for pi-subagents without replacing its orchestration",
+  "description": "Opt-in Pi Atelier and Herdr visibility for pi-subagents without replacing its orchestration",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -24,10 +24,18 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.86.1",
+    "@earendil-works/pi-tui": ">=0.86.1",
+    "pi-atelier": ">=0.10.2",
     "pi-subagents": ">=0.70.1"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "pi-atelier": {
       "optional": true
     },
     "pi-subagents": {
@@ -36,6 +44,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.86.1",
+    "@earendil-works/pi-tui": "0.86.1",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
   },

@@ -22,6 +22,8 @@ export interface AsyncStartedEvent {
   agent?: string;
   agents?: string[];
   workflowGraph?: WorkflowGraph;
+  parentWorkflowRunId?: string;
+  workflowKey?: string;
 }
 
 export interface ChildStartedEvent {
@@ -33,6 +35,7 @@ export interface ChildStartedEvent {
   asyncDir: string;
   agent: string;
   workflowKey: string;
+  childRunId?: string;
   stepIndex?: number;
 }
 
@@ -71,11 +74,38 @@ interface HerdrSplitResponse {
   pane_id?: unknown;
 }
 
+interface HerdrLayoutResponse {
+  result?: {
+    layout?: {
+      panes?: Array<{
+        pane_id?: unknown;
+        rect?: { width?: unknown; height?: unknown };
+      }>;
+    };
+  };
+}
+
+interface HerdrProcessInfoResponse {
+  result?: {
+    process_info?: {
+      pane_id?: unknown;
+      shell_pid?: unknown;
+      foreground_process_group_id?: unknown;
+      foreground_processes?: Array<{
+        pid?: unknown;
+        name?: unknown;
+        argv0?: unknown;
+      }>;
+    };
+  };
+}
+
 interface InspectorChild {
   identity: string;
   agent: string;
   index?: number;
   workflowKey?: string;
+  childRunId?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,6 +129,10 @@ function parseStartedEvent(value: unknown): AsyncStartedEvent | undefined {
   const agent = typeof value.agent === "string" && value.agent.length > 0 ? value.agent : undefined;
   const mode = typeof value.mode === "string" && value.mode.length > 0 ? value.mode : undefined;
   const workflowGraph = parseWorkflowGraph(value.workflowGraph);
+  const parentWorkflowRunId = typeof value.parentWorkflowRunId === "string" && value.parentWorkflowRunId.length > 0
+    ? value.parentWorkflowRunId
+    : undefined;
+  const workflowKey = typeof value.workflowKey === "string" && value.workflowKey.length > 0 ? value.workflowKey : undefined;
   return {
     lifecycleArtifactVersion: value.lifecycleArtifactVersion as number,
     id: value.id as string,
@@ -109,6 +143,8 @@ function parseStartedEvent(value: unknown): AsyncStartedEvent | undefined {
     ...(agent ? { agent } : {}),
     ...(agents ? { agents } : {}),
     ...(workflowGraph ? { workflowGraph } : {}),
+    ...(parentWorkflowRunId ? { parentWorkflowRunId } : {}),
+    ...(workflowKey ? { workflowKey } : {}),
   };
 }
 
@@ -118,6 +154,7 @@ function parseChildStartedEvent(value: unknown): ChildStartedEvent | undefined {
     if (typeof value[key] !== "string" || value[key].length === 0) return undefined;
   }
   const stepIndex = Number.isInteger(value.stepIndex) && (value.stepIndex as number) >= 0 ? value.stepIndex as number : undefined;
+  const childRunId = typeof value.childRunId === "string" && value.childRunId.length > 0 ? value.childRunId : undefined;
   return {
     type: "subagent.child-status",
     version: 1,
@@ -127,6 +164,7 @@ function parseChildStartedEvent(value: unknown): ChildStartedEvent | undefined {
     asyncDir: value.asyncDir as string,
     agent: value.agent as string,
     workflowKey: value.workflowKey as string,
+    ...(childRunId ? { childRunId } : {}),
     ...(stepIndex !== undefined ? { stepIndex } : {}),
   };
 }
@@ -154,6 +192,42 @@ function quoteShell(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function parseOwnedSplitTargets(stdout: string, ownedPaneIds: ReadonlySet<string>): Array<{ paneId: string }> {
+  let parsed: HerdrLayoutResponse;
+  try {
+    parsed = JSON.parse(stdout) as HerdrLayoutResponse;
+  } catch {
+    return [];
+  }
+  const panes = parsed.result?.layout?.panes;
+  if (!Array.isArray(panes)) return [];
+  const candidates = panes.flatMap((pane) => {
+    if (typeof pane.pane_id !== "string" || !ownedPaneIds.has(pane.pane_id)) return [];
+    const width = pane.rect?.width;
+    const height = pane.rect?.height;
+    if (typeof width !== "number" || typeof height !== "number" || width <= 0 || height <= 0) return [];
+    return [{ paneId: pane.pane_id, area: width * height }];
+  });
+  candidates.sort((left, right) => right.area - left.area);
+  return candidates.map(({ paneId }) => ({ paneId }));
+}
+
+function parseObserverPid(stdout: string, paneId: string): number | undefined {
+  let parsed: HerdrProcessInfoResponse;
+  try {
+    parsed = JSON.parse(stdout) as HerdrProcessInfoResponse;
+  } catch {
+    return undefined;
+  }
+  const info = parsed.result?.process_info;
+  if (info?.pane_id !== paneId || !Number.isInteger(info.foreground_process_group_id) || !Array.isArray(info.foreground_processes)) return undefined;
+  const observerProcess = info.foreground_processes.find((candidate) => {
+    if (!Number.isInteger(candidate.pid) || candidate.pid !== info.foreground_process_group_id || candidate.pid === info.shell_pid) return false;
+    return candidate.name === "node" || candidate.argv0 === "node" || candidate.argv0 === process.execPath;
+  });
+  return observerProcess?.pid as number | undefined;
+}
+
 function enabledFromEnvironment(env: NodeJS.ProcessEnv): boolean {
   return ["1", "true", "on", "yes"].includes((env.PI_NAVRNESS_HERDR_VISIBILITY ?? "").toLowerCase());
 }
@@ -174,6 +248,9 @@ export class HerdrInspectorManager {
   private readonly opened = new Set<string>();
   private readonly pending = new Set<string>();
   private readonly workflowRoots = new Map<string, AsyncStartedEvent>();
+  private readonly ownedObserverPids = new Map<string, number>();
+  private createdInspectorRegion = false;
+  private creationQueue: Promise<void> = Promise.resolve();
   private readonly runtime: InspectorRuntime;
   private readonly sessionId: () => string | undefined;
   private readonly observerPath: string;
@@ -211,6 +288,9 @@ export class HerdrInspectorManager {
       return;
     }
     if (event.sessionId !== this.sessionId()) return;
+    // A workflow child emits its own async-started event as well as the keyed
+    // root child event. The latter is authoritative and prevents duplicate panes.
+    if (event.parentWorkflowRunId && event.workflowKey) return;
     if (event.mode === "workflow") {
       if (this.paneBudget.opened + this.paneBudget.reserved >= this.maxPanes) {
         this.notifyPaneCap();
@@ -262,6 +342,7 @@ export class HerdrInspectorManager {
       identity: `workflow:${child.workflowKey}`,
       agent: child.agent,
       workflowKey: child.workflowKey,
+      ...(child.childRunId ? { childRunId: child.childRunId } : {}),
       ...(child.stepIndex !== undefined ? { index: child.stepIndex } : {}),
     });
   }
@@ -285,18 +366,64 @@ export class HerdrInspectorManager {
     this.pending.add(key);
     this.paneBudget.reserved += 1;
 
+    const creation = this.creationQueue.then(() => this.createInspector(event, child, key));
+    this.creationQueue = creation.catch(() => undefined);
+    await creation;
+  }
+
+  private async createInspector(event: AsyncStartedEvent, child: InspectorChild, key: string): Promise<void> {
     let ownedPaneId: string | undefined;
     try {
-      const split = await this.runtime.exec("herdr", [
-        "pane",
-        "split",
-        "--current",
-        "--direction",
-        "right",
-        "--cwd",
-        event.cwd,
-        "--no-focus",
-      ]);
+      let splitArgs: string[];
+      if (!this.createdInspectorRegion) {
+        // Herdr applies the ratio to the existing (first) pane. Keep Pi on the
+        // left at 65% and reserve the new right-hand region for inspectors.
+        splitArgs = ["pane", "split", "--current", "--direction", "right", "--ratio", "0.65", "--cwd", event.cwd, "--no-focus"];
+      } else if (this.ownedObserverPids.size > 0) {
+        const layout = await this.runtime.exec("herdr", ["pane", "layout", "--current"]);
+        const targets = layout.code === 0
+          ? parseOwnedSplitTargets(layout.stdout, new Set(this.ownedObserverPids.keys()))
+          : [];
+        let targetPaneId: string | undefined;
+        for (const target of targets) {
+          const expectedPid = this.ownedObserverPids.get(target.paneId);
+          const processInfo = await this.runtime.exec("herdr", ["pane", "process-info", "--pane", target.paneId]);
+          const actualPid = processInfo.code === 0 ? parseObserverPid(processInfo.stdout, target.paneId) : undefined;
+          if (actualPid === expectedPid) {
+            targetPaneId = target.paneId;
+            break;
+          }
+          this.ownedObserverPids.delete(target.paneId);
+        }
+        if (!targetPaneId) {
+          this.ownedObserverPids.clear();
+          this.runtime.notify(
+            `pi-navrness kept ${child.agent} headless because no live owned observer pane was available.`,
+            "warning",
+          );
+          return;
+        }
+        splitArgs = [
+          "pane",
+          "split",
+          "--pane",
+          targetPaneId,
+          "--direction",
+          "down",
+          "--ratio",
+          "0.5",
+          "--cwd",
+          event.cwd,
+          "--no-focus",
+        ];
+      } else {
+        this.runtime.notify(
+          `pi-navrness kept ${child.agent} headless because the observer region is no longer owned by a live observer.`,
+          "warning",
+        );
+        return;
+      }
+      const split = await this.runtime.exec("herdr", splitArgs);
       if (split.code !== 0) throw new Error(split.stderr.trim() || `herdr pane split exited ${split.code}`);
       ownedPaneId = parsePaneId(split.stdout);
       if (!ownedPaneId) throw new Error("herdr pane split returned no pane id");
@@ -309,12 +436,28 @@ export class HerdrInspectorManager {
         "--run-id",
         event.id,
         ...(child.workflowKey ? ["--workflow-key", child.workflowKey] : ["--index", String(child.index)]),
+        ...(child.childRunId ? ["--child-run-id", child.childRunId] : []),
         "--agent",
         child.agent,
       ];
       const command = observerArgs.map(quoteShell).join(" ");
       const started = await this.runtime.exec("herdr", ["pane", "run", ownedPaneId, command]);
       if (started.code !== 0) throw new Error(started.stderr.trim() || `herdr pane run exited ${started.code}`);
+      const ready = await this.runtime.exec("herdr", [
+        "pane",
+        "wait-output",
+        ownedPaneId,
+        "--match",
+        `run ${event.id} · child`,
+        "--timeout",
+        "2000",
+      ]);
+      const processInfo = ready.code === 0
+        ? await this.runtime.exec("herdr", ["pane", "process-info", "--pane", ownedPaneId])
+        : undefined;
+      const observerPid = processInfo?.code === 0 ? parseObserverPid(processInfo.stdout, ownedPaneId) : undefined;
+      this.createdInspectorRegion = true;
+      if (observerPid !== undefined) this.ownedObserverPids.set(ownedPaneId, observerPid);
       this.opened.add(key);
       this.paneBudget.opened += 1;
     } catch (error) {

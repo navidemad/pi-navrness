@@ -36,6 +36,24 @@ function setup(options: {
         pane += 1;
         return { stdout: JSON.stringify({ result: { pane: { pane_id: `w1:p${pane + 1}` } } }), stderr: "", code: 0 };
       }
+      if (args[1] === "layout") {
+        return {
+          stdout: JSON.stringify({
+            result: { layout: { panes: Array.from({ length: pane }, (_, index) => ({ pane_id: `w1:p${index + 2}`, rect: { width: 60, height: 60 } })) } },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[1] === "process-info") {
+        const paneId = args[3] ?? "";
+        const pid = 200 + Number.parseInt(paneId.split("p").at(-1) ?? "0", 10);
+        return {
+          stdout: JSON.stringify({ result: { process_info: { pane_id: paneId, shell_pid: 100, foreground_process_group_id: pid, foreground_processes: [{ pid, name: "node", argv0: "node" }] } } }),
+          stderr: "",
+          code: 0,
+        };
+      }
       return { stdout: "{}", stderr: "", code: 0 };
     },
     notify(message, level) {
@@ -80,12 +98,13 @@ function childEvent(overrides: Record<string, unknown> = {}) {
     asyncDir: "/tmp/run-1",
     agent: "reviewer",
     workflowKey: "review",
+    childRunId: "child-run-review",
     stepIndex: 0,
     ...overrides,
   };
 }
 
-test("opens one passive Herdr inspector per announced child", async () => {
+test("serializes concurrent child panes into a 65/35 layout with inspectors stacked right", async () => {
   const { manager, calls, notifications } = setup();
   await manager.handleAsyncStarted(event());
 
@@ -93,9 +112,69 @@ test("opens one passive Herdr inspector per announced child", async () => {
   const runs = calls.filter((call) => call.args[1] === "run");
   assert.equal(splits.length, 2);
   assert.equal(runs.length, 2);
+  assert.deepEqual(splits[0]?.args.slice(0, 9), ["pane", "split", "--current", "--direction", "right", "--ratio", "0.65", "--cwd", "/tmp/project"]);
+  assert.deepEqual(splits[1]?.args.slice(0, 9), ["pane", "split", "--pane", "w1:p2", "--direction", "down", "--ratio", "0.5", "--cwd"]);
   assert.ok(runs[0]?.args[3]?.includes("--index' '0"));
   assert.ok(runs[1]?.args[3]?.includes("--index' '1"));
   assert.deepEqual(notifications, []);
+});
+
+test("subsequent inspectors split the largest owned pane, never an unrelated pane", async () => {
+  const responses: CommandResult[] = [
+    { stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p2" } } }), stderr: "", code: 0 },
+    { stdout: "{}", stderr: "", code: 0 },
+    { stdout: "{}", stderr: "", code: 0 },
+    { stdout: JSON.stringify({ result: { process_info: { pane_id: "w1:p2", shell_pid: 100, foreground_process_group_id: 202, foreground_processes: [{ pid: 202, name: "node", argv0: "node" }] } } }), stderr: "", code: 0 },
+    {
+      stdout: JSON.stringify({
+        result: {
+          layout: {
+            panes: [
+              { pane_id: "w1:p1", rect: { width: 180, height: 60 } },
+              { pane_id: "w1:p2", rect: { width: 60, height: 60 } },
+            ],
+          },
+        },
+      }),
+      stderr: "",
+      code: 0,
+    },
+    { stdout: JSON.stringify({ result: { process_info: { pane_id: "w1:p2", shell_pid: 100, foreground_process_group_id: 202, foreground_processes: [{ pid: 202, name: "node", argv0: "node" }] } } }), stderr: "", code: 0 },
+    { stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p3" } } }), stderr: "", code: 0 },
+    { stdout: "{}", stderr: "", code: 0 },
+    { stdout: "{}", stderr: "", code: 0 },
+    { stdout: JSON.stringify({ result: { process_info: { pane_id: "w1:p3", shell_pid: 100, foreground_process_group_id: 203, foreground_processes: [{ pid: 203, name: "node", argv0: "node" }] } } }), stderr: "", code: 0 },
+  ];
+  const { manager, calls } = setup({ responses });
+  await manager.handleAsyncStarted(event());
+
+  const splits = calls.filter((call) => call.args[1] === "split");
+  assert.deepEqual(splits[1]?.args.slice(0, 8), ["pane", "split", "--pane", "w1:p2", "--direction", "down", "--ratio", "0.5"]);
+});
+
+test("later workflows stay headless after an owned observer exits or its pane closes", async () => {
+  for (const unavailableLayout of [
+    [{ pane_id: "w1:p2", rect: { width: 60, height: 60 } }],
+    [],
+  ]) {
+    const responses: CommandResult[] = [
+      { stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p2" } } }), stderr: "", code: 0 },
+      { stdout: "{}", stderr: "", code: 0 },
+      { stdout: "{}", stderr: "", code: 0 },
+      { stdout: JSON.stringify({ result: { process_info: { pane_id: "w1:p2", shell_pid: 100, foreground_process_group_id: 202, foreground_processes: [{ pid: 202, name: "node", argv0: "node" }] } } }), stderr: "", code: 0 },
+      { stdout: JSON.stringify({ result: { layout: { panes: unavailableLayout } } }), stderr: "", code: 0 },
+      ...(unavailableLayout.length > 0
+        ? [{ stdout: JSON.stringify({ result: { process_info: { pane_id: "w1:p2", shell_pid: 100, foreground_process_group_id: 100, foreground_processes: [{ pid: 100, name: "fish", argv0: "fish" }] } } }), stderr: "", code: 0 }]
+        : []),
+    ];
+    const { manager, calls, notifications } = setup({ responses });
+    await manager.handleAsyncStarted(event({ id: "first", agents: ["worker"] }));
+    await manager.handleAsyncStarted(event({ id: "later", agents: ["reviewer"] }));
+
+    assert.equal(calls.filter((call) => call.args[1] === "split").length, 1);
+    assert.equal(calls.filter((call) => call.args[1] === "split" && call.args.includes("--current")).length, 1);
+    assert.match(notifications.at(-1)?.message ?? "", /kept reviewer headless/);
+  }
 });
 
 test("entrypoint matches persisted and ephemeral pi-subagents session identities", async () => {
@@ -211,8 +290,28 @@ test("opens a workflow inspector from the stable keyed child lifecycle contract"
   assert.equal(calls.filter((call) => call.args[1] === "split").length, 1);
   const run = calls.find((call) => call.args[1] === "run");
   assert.ok(run?.args[3]?.includes("--workflow-key' 'review"));
+  assert.ok(run?.args[3]?.includes("--child-run-id' 'child-run-review"));
   assert.equal(run?.args[3]?.includes("--index"), false);
   assert.deepEqual(notifications, []);
+});
+
+test("uses the keyed root event instead of opening a duplicate direct workflow child", async () => {
+  const { manager, calls } = setup();
+  await manager.handleAsyncStarted(event({ mode: "workflow", agent: "workflow", agents: undefined }));
+  await manager.handleAsyncStarted(event({
+    id: "child-run-review",
+    mode: "single",
+    agents: ["reviewer"],
+    asyncDir: "/tmp/child-run-review",
+    parentWorkflowRunId: "run-1",
+    workflowKey: "review",
+  }));
+  await manager.handleChildStatus(childEvent());
+
+  assert.equal(calls.filter((call) => call.args[1] === "split").length, 1);
+  const run = calls.find((call) => call.args[1] === "run");
+  assert.ok(run?.args[3]?.includes("--run-id' 'run-1"));
+  assert.ok(run?.args[3]?.includes("--child-run-id' 'child-run-review"));
 });
 
 test("rejects a keyed child whose artifact directory does not match its workflow root", async () => {
